@@ -1,0 +1,54 @@
+// BYOVD Attack Detection - Single Query Approach
+// Detects suspicious driver loads followed by Windows Defender tampering
+
+DeviceEvents
+| where ActionType == "DriverLoad"
+| where TimeGenerated > ago(7d)
+| where FileName has_any (
+    "procexp152.sys", "procexp.sys", "RTCore64.sys", "RTCore32.sys",
+    "capcom.sys", "gdrv.sys", "dbutil_2_3.sys", "iqvw64e.sys",
+    "winring0x64.sys", "winring0.sys", "msio64.sys", "msio32.sys",
+    "AsUpIO64.sys", "AsIO64.sys", "zamguard64.sys", "zamguard32.sys",
+    "hw64.sys", "hw32.sys", "inpoutx64.sys", "inpout32.sys", "tunnel.sys"
+)
+| join kind=inner (
+    DeviceEvents
+    | where TimeGenerated > ago(7d)
+    | where (
+        (ActionType == "ServiceConfigurationChange" and FileName in ("WinDefend", "WdNisSvc", "Sense", "WdBoot", "WdFilter")) or
+        (ActionType == "ProcessTerminated" and FileName has_any ("MsMpEng.exe", "NisSrv.exe", "SenseCncProxy.exe", "SenseIR.exe")) or
+        (ActionType == "RegistryValueSet" and RegistryKey has_any (
+            "SOFTWARE\\Microsoft\\Windows Defender",
+            "SOFTWARE\\Policies\\Microsoft\\Windows Defender",
+            "SYSTEM\\CurrentControlSet\\Services\\WinDefend",
+            "SYSTEM\\CurrentControlSet\\Services\\WdNisSvc"
+        )) or
+        (ActionType == "RegistryValueSet" and RegistryKey has_any (
+            "SOFTWARE\\Microsoft\\Windows Defender\\Features\\TamperProtection",
+            "SOFTWARE\\Policies\\Microsoft\\Windows Defender\\Features\\TamperProtection"
+        ) and RegistryValueName == "TamperProtection" and RegistryValueData == "0") or
+        (ActionType == "PowerShellCommand" and AdditionalFields has_any ("Set-MpPreference", "DisableRealtimeMonitoring", "DisableBehaviorMonitoring", "Add-MpPreference", "ExclusionPath"))
+    )
+    | extend EventType = case(
+        ActionType == "ServiceConfigurationChange", "ServiceTampering",
+        ActionType == "ProcessTerminated", "ProcessKill",
+        ActionType == "RegistryValueSet" and RegistryKey has "TamperProtection", "TamperProtectionDisable",
+        ActionType == "RegistryValueSet", "RegistryTampering",
+        ActionType == "PowerShellCommand", "PowerShellDefenderDisable",
+        "Other"
+    )
+    | extend PowerShellCommand = iff(ActionType == "PowerShellCommand", tostring(parse_json(AdditionalFields).Command), "")
+) on DeviceId
+| where (TimeGenerated1 - TimeGenerated) between (0min .. 30min)
+| extend Severity = case(
+    EventType == "TamperProtectionDisable", "Critical",
+    EventType == "PowerShellDefenderDisable", "High",
+    EventType in ("ServiceTampering", "ProcessKill"), "High",
+    "Medium"
+)
+| project DeviceName, Severity, DriverLoadTime=TimeGenerated, TamperingTime=TimeGenerated1,
+          DriverFile=FileName, DriverHash=SHA256, DriverPath=FolderPath,
+          TamperingProcess=InitiatingProcessFileName1, TamperingCommand=InitiatingProcessCommandLine1,
+          EventType, TargetService=FileName1, RegistryKey, RegistryValueName, RegistryValueData,
+          PowerShellCommand, Account=InitiatingProcessAccountName1, DeviceId
+| order by DriverLoadTime desc
